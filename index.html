@@ -843,7 +843,7 @@ code{background:rgba(232,255,0,0.08);padding:2px 6px;border-radius:3px;font-size
     -webkit-overflow-scrolling:touch!important;
     overscroll-behavior:contain!important;
     background:#525659!important;
-    padding:0!important;
+    padding:8px!important;
     box-sizing:border-box!important;
   }
   /* ══ SCROLLBAR NASCOSTA ══ */
@@ -5326,19 +5326,19 @@ function renderPDFtoContainer(dataUrl, container, height){
     // Larghezza logica base: larghezza container senza padding
     function baseW(){ return (container.clientWidth || container.offsetWidth || window.innerWidth) - 16; }
 
-    // ── RENDERIZZA ad alta qualità (solo dopo pinch-end o zoom bottoni) ──
-    function renderAll(zoom, rSX, rSY){
+    // ── RENDERIZZA ad alta qualità ──────────────────────────────
+    // rSX/rSY: scroll da ripristinare. onDone: callback opzionale quando tutto è pronto.
+    function renderAll(zoom, rSX, rSY, onDone){
       userZoom = Math.min(4, Math.max(0.25, zoom != null ? zoom : userZoom));
       var bw   = baseW();
       var cssW = Math.round(bw * userZoom);
-      // Resetta CSS transform: adesso i canvas hanno le dimensioni reali
-      inner.style.transition       = '';
-      inner.style.transform        = '';
-      inner.style.transformOrigin  = '0 0';
-      inner.style.width            = (cssW + 16) + 'px';
-      inner.style.minWidth         = inner.style.width;
+      inner.style.transform       = '';
+      inner.style.transformOrigin = '0 0';
+      inner.style.width           = (cssW + 16) + 'px';
+      inner.style.minWidth        = inner.style.width;
       var total = 0, done = 0;
       for(var _p=1;_p<=numPages;_p++){ if(pdfPages[_p]) total++; }
+      if(total === 0){ if(onDone) onDone(); return; }
       for(var p=1; p<=numPages; p++){
         (function(num){
           if(!pdfPages[num]) return;
@@ -5356,10 +5356,12 @@ function renderPDFtoContainer(dataUrl, container, height){
           cv.style.transform    = '';
           page.render({canvasContext:cv.getContext('2d'), viewport:vp}).promise.then(function(){
             done++;
-            if(done === total && (rSX != null || rSY != null)){
+            if(done === total){
+              // Tutti i canvas pronti: ora (e solo ora) aggiorniamo DOM visibile
               requestAnimationFrame(function(){
                 if(rSX != null) container.scrollLeft = rSX;
                 if(rSY != null) container.scrollTop  = rSY;
+                if(onDone) onDone();
               });
             }
           });
@@ -5387,39 +5389,31 @@ function renderPDFtoContainer(dataUrl, container, height){
     }
 
     // ══════════════════════════════════════════════════════════
-    // PINCH-TO-ZOOM — zero delay, zero flash, completamente fluido
+    // PINCH-TO-ZOOM — fluido, senza flash, senza refresh visibile
     //
-    // STRATEGIA anti-flash:
-    //   • Durante il pinch NON tocchiamo scrollLeft/scrollTop né
-    //     re-renderiziamo nulla. Usiamo solo CSS transform sul container
-    //     tramite un wrapper apposito (zoomEl).
-    //   • Il container viene scalato visivamente via CSS scale, con
-    //     transform-origin = punto delle dita (in coordinate container).
-    //   • Al touchend: calcoliamo lo scroll corretto, re-renderiziamo
-    //     ad alta qualità, ripristiniamo scroll → nessun flash.
+    // DOM:
+    //   container (overflow:scroll)
+    //     └─ zoomEl  ← scalato via CSS durante il pinch (GPU layer)
+    //          └─ inner ← canvas PDF
     //
-    // DOM durante il pinch:
-    //   container (overflow:scroll, NON scalato)
-    //     └─ zoomEl  (scalato via CSS, transform-origin = punto dita)
-    //          └─ inner (padding + canvas)
+    // Durante il pinch: scala solo zoomEl, mai scrollLeft/Top, mai canvas.
+    // Al touchend: renderAll() ridisegna i canvas ad alta qualità.
+    //   Il trick anti-flash: zoomEl rimane scalato MENTRE i canvas vengono
+    //   ridisegnati. Solo quando renderAll() ha finito (onDone callback)
+    //   resettiamo zoomEl in modo atomico insieme allo scroll corretto,
+    //   tutto dentro un unico requestAnimationFrame → zero frame vuoti.
     // ══════════════════════════════════════════════════════════
-
-    // Wrapper che viene scalato durante il pinch
     var zoomEl = document.createElement('div');
-    zoomEl.style.cssText = 'transform-origin:0 0;will-change:transform;';
-    // Sposta inner dentro zoomEl
+    zoomEl.style.cssText = 'transform-origin:0 0;will-change:transform;display:block;';
     container.removeChild(inner);
     zoomEl.appendChild(inner);
     container.appendChild(zoomEl);
 
     var pz = {
-      on:    false,
-      d0:    1,       // distanza iniziale
-      z0:    1,       // userZoom al touchstart
-      ox:    0,       // transform-origin X nel container (coordinate viewport-relative)
-      oy:    0,       // transform-origin Y nel container (coordinate viewport-relative)
-      ratio: 1,       // scala CSS corrente
-      timer: null
+      on:false, d0:1, z0:1,
+      ox:0, oy:0,       // transform-origin relativo al container (fisso per tutto il pinch)
+      ratio:1,
+      timer:null
     };
 
     function pzDist(e){
@@ -5427,10 +5421,10 @@ function renderPDFtoContainer(dataUrl, container, height){
       var dy=e.touches[0].clientY-e.touches[1].clientY;
       return Math.sqrt(dx*dx+dy*dy)||1;
     }
-    function pzMidViewport(e){
+    function pzMid(e, rect){
       return {
-        x:(e.touches[0].clientX+e.touches[1].clientX)*0.5,
-        y:(e.touches[0].clientY+e.touches[1].clientY)*0.5
+        x:(e.touches[0].clientX+e.touches[1].clientX)*0.5 - rect.left,
+        y:(e.touches[0].clientY+e.touches[1].clientY)*0.5 - rect.top
       };
     }
 
@@ -5439,14 +5433,13 @@ function renderPDFtoContainer(dataUrl, container, height){
         e.preventDefault();
         if(pz.timer){ clearTimeout(pz.timer); pz.timer=null; }
         var rect = container.getBoundingClientRect();
-        var mid  = pzMidViewport(e);
+        var mid  = pzMid(e, rect);
         pz.on    = true;
         pz.d0    = pzDist(e);
         pz.z0    = userZoom;
         pz.ratio = 1;
-        // origin in coordinate RELATIVE AL CONTAINER (non cambiano durante il pinch)
-        pz.ox    = mid.x - rect.left;
-        pz.oy    = mid.y - rect.top;
+        pz.ox    = mid.x;
+        pz.oy    = mid.y;
         zoomEl.style.transformOrigin = pz.ox+'px '+pz.oy+'px';
         zoomEl.style.transform       = 'scale(1)';
       }
@@ -5455,12 +5448,10 @@ function renderPDFtoContainer(dataUrl, container, height){
     container.addEventListener('touchmove', function(e){
       if(!pz.on || e.touches.length < 2) return;
       e.preventDefault();
-      var ratio    = pzDist(e) / pz.d0;
-      ratio        = Math.min(4/pz.z0, Math.max(0.25/pz.z0, ratio));
-      pz.ratio     = ratio;
-      userZoom     = pz.z0 * ratio;
-      // Scala zoomEl — il browser applica la trasformazione in un singolo
-      // compositing layer: 60fps garantiti, zero reflow, zero flash
+      var ratio = pzDist(e) / pz.d0;
+      ratio     = Math.min(4/pz.z0, Math.max(0.25/pz.z0, ratio));
+      pz.ratio  = ratio;
+      userZoom  = pz.z0 * ratio;
       zoomEl.style.transform = 'scale('+ratio+')';
       document.querySelectorAll('#btn-timer-zoom-lbl,#scheda-zoom-lbl').forEach(function(l){
         l.textContent = Math.round(userZoom*100)+'%';
@@ -5472,34 +5463,33 @@ function renderPDFtoContainer(dataUrl, container, height){
       if(e.touches.length < 2){
         pz.on = false;
         var finalZ  = userZoom;
-        // Calcola dove punta il centro visibile DOPO la scala CSS:
-        // Il punto pz.ox/pz.oy nel container rimane fisso, ma lo scroll
-        // logico cambia perché il contenuto è ora più grande/piccolo.
-        // scrollNew = scrollOld + origin*(ratio-1)
-        var finalSX = container.scrollLeft + pz.ox * (pz.ratio - 1);
-        var finalSY = container.scrollTop  + pz.oy * (pz.ratio - 1);
-        finalSX     = Math.max(0, finalSX);
-        finalSY     = Math.max(0, finalSY);
-        // Prima di re-renderizzare: già mostriamo la posizione corretta
-        // tramite la scala CSS, quindi l'utente non vede nessun flash.
-        // Poi sostituiamo con il render ad alta qualità.
-        pz.timer = setTimeout(function(){
-          // Reset zoomEl prima del re-render
-          zoomEl.style.transform = '';
-          renderAll(finalZ, finalSX, finalSY);
-        }, 16); // 1 frame di anticipo basta
+        // Scroll corretto: origin*(ratio-1) = quanto si è spostato il contenuto
+        var finalSX = Math.max(0, container.scrollLeft + pz.ox * (pz.ratio - 1));
+        var finalSY = Math.max(0, container.scrollTop  + pz.oy * (pz.ratio - 1));
+
+        // Ridisegna i canvas ad alta qualità IN BACKGROUND (zoomEl è ancora scalato,
+        // l'utente vede già il risultato corretto via CSS).
+        // Solo quando TUTTI i canvas sono pronti: in un singolo rAF resettiamo
+        // zoomEl + impostiamo scroll → zero flash, zero frame intermedi.
+        renderAll(finalZ, null, null, function(){
+          requestAnimationFrame(function(){
+            zoomEl.style.transform = '';
+            container.scrollLeft   = finalSX;
+            container.scrollTop    = finalSY;
+          });
+        });
       }
     }, {passive:true});
 
     // ── API pubblica ───────────────────────────────────────────
     container._applyZoom = function(z){
-      var ratio  = z / userZoom;
-      var newSX  = Math.max(0, (container.scrollLeft + container.clientWidth/2)  * ratio - container.clientWidth/2);
-      var newSY  = Math.max(0, (container.scrollTop  + container.clientHeight/2) * ratio - container.clientHeight/2);
+      var ratio = z / userZoom;
+      var newSX = Math.max(0,(container.scrollLeft+container.clientWidth/2)*ratio - container.clientWidth/2);
+      var newSY = Math.max(0,(container.scrollTop+container.clientHeight/2)*ratio - container.clientHeight/2);
       renderAll(z, newSX, newSY);
     };
     container._getZoom = function(){ return userZoom; };
-    container._resize  = function(){ setTimeout(function(){ renderAll(userZoom); }, 50); };
+    container._resize  = function(){ setTimeout(function(){ renderAll(userZoom); },50); };
   }).catch(function(err){
     console.error('PDF error:', err);
     container.innerHTML = '<div style="padding:32px;text-align:center;color:#fff;"><p style="color:#aaa;margin-bottom:16px;">Errore caricamento PDF.</p><a style="background:#e8ff00;color:#000;padding:12px 24px;border-radius:2px;font-weight:700;text-decoration:none;font-size:13px;" href="'+dataUrl+'" download="scheda.pdf">&#8595; Scarica PDF</a></div>';
