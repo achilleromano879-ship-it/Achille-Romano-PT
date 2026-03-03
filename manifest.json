@@ -1,0 +1,10 @@
+{
+  "name": "Achille Romano PT",
+  "short_name": "AR PT",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "start_url": "./index.html",
+  "scope": "./"
+}
